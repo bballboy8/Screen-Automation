@@ -66,6 +66,11 @@ async def main():
         "  - Read every question carefully and answer every question shown on the current page before submitting.\n"
         "  - DO NOT pick default/first answers. Use reasoning to choose the best answer for each question.\n"
         "  - First, use evaluate() to extract a structured JSON snapshot of ALL visible questions, including question text and options.\n"
+        "  - Never use extract() on quiz pages. extract() often omits input IDs and is not reliable for answer selection.\n"
+        "  - REQUIRED extraction schema per option: {text, inputId, inputName, inputValue}.\n"
+        "  - For every option, find the real input element (radio/checkbox/select option) and capture its id attribute as inputId.\n"
+        "  - If an option has no id attribute, set inputId to null and still capture inputName and inputValue.\n"
+        "  - Return JSON only from evaluate(): [{questionText, options:[{text,inputId,inputName,inputValue}]}].\n"
         "  - Then reason over that extracted content and choose answers before interacting with the page.\n"
         "  - IMPORTANT: Never rely on hardcoded or guessed question/fieldset IDs (for example ef-question-xxxxx from prior steps). IDs may change.\n"
         "  - Always locate questions by visible question text and option label text at interaction time.\n"
@@ -76,11 +81,13 @@ async def main():
         "    * Matching/drag-and-drop: map right-side choices to left-side prompts, then use evaluate() to dispatch dragstart/dragover/drop events to perform the match.\n"
         "  - RADIO RELIABILITY: many radios are custom-styled. If input.click() fails, click the associated label text/circle, then dispatch input+change events and verify checked=true.\n"
         "  - RADIO MATCHING: when selecting a radio answer, locate the target question block by question text, then locate the option label by text, then activate its linked input via label[for] or nearest input.\n"
+        "  - Prefer ID-based selection when possible: if inputId exists, select via getElementById(inputId) first, then fallback to text matching.\n"
         "  - If browser-level popups (password/save prompts) appear, dismiss them first (Escape) before trying to click answer controls again.\n"
-        "  - Execution order: (1) extract page questions -> (2) decide answers -> (3) apply all answers with one robust evaluate() pass using text matching -> (4) verify selected states -> (5) submit.\n"
+        "  - Execution order: (1) evaluate-extract questions+IDs -> (2) decide answers -> (3) apply all answers with one robust evaluate() pass (ID first, text fallback) -> (4) verify selected states and on-page 'questions answered' counter if present -> (5) submit.\n"
         "  - If any answer application fails, re-extract current visible DOM and retry once using text matching; do not repeat the same broken selector.\n"
         "  - If a click/select/drag action fails, refresh state once and retry with evaluate() using robust text-based selectors (not hardcoded question IDs).\n"
         "  - Confirm each question has a visible selected state (checked/highlighted/selected/matched) before clicking 'Submit'.\n"
+        "  - If visual checks disagree with the page counter (for example 'Questions answered: 0 of N'), treat as failure and re-apply selections with change/input events.\n"
         "  - Never click navigation tree items while unanswered questions remain on the page.\n"
         "  - After ALL questions on the page are answered, click 'Submit' once.\n"
         "  - After Submit, click 'Continue' or 'Next' to advance.\n"
@@ -98,7 +105,7 @@ async def main():
         "  - After every click, wait for the page to finish loading before clicking again.\n"
     )
 
-    constrained_tools = Tools(exclude_actions=["find_elements", "write_file", "replace_file", "read_file"])
+    constrained_tools = Tools(exclude_actions=["find_elements", "write_file", "replace_file", "read_file", "extract"])
 
     def build_agent() -> Agent:
         return Agent(
