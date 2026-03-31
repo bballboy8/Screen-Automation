@@ -53,12 +53,12 @@ async def main():
         temperature=0.0,
     )
     quiz_reasoner_llm = ChatGoogle(
-        model="gemini-2.5-pro",
+        model="gemini-2.5-flash",
         api_key=os.getenv("GOOGLE_API_KEY"),
         temperature=0.0,
     )
     quiz_reasoner_fallback_llm = ChatGoogle(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-pro",
         api_key=os.getenv("GOOGLE_API_KEY"),
         temperature=0.0,
     )
@@ -380,64 +380,121 @@ async def main():
             if guard.last_quiz_signature == quiz_signature and (now - guard.last_quiz_action_ts) < 12:
                 return
 
-            # Build compact prompt with option indexes + ids so the LLM can choose deterministically.
-            lines = []
-            for q in questions:
-                lines.append(f"Q{q['questionNumber']}: {q['questionText']}")
-                for idx, opt in enumerate(q.get("options", []), 1):
-                    lines.append(f"  {idx}. {opt.get('text', '')} [id={opt.get('inputId', '')}]")
+            def parse_answer_payload(raw_text: str) -> dict | None:
+                if not raw_text:
+                    return None
+                text = raw_text.strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```(?:json)?", "", text).strip()
+                    text = re.sub(r"```$", "", text).strip()
 
-            llm_prompt = (
-                "You are a CFP exam expert. Choose the best answer for each question. "
-                "Return ONLY valid JSON with this schema: "
-                "{\"answers\": [{\"questionNumber\": <int>, \"optionIndexes\": [<int>, ...], \"inputIds\": [<string>, ...]}]}. "
-                "ALWAYS include inputIds using the exact ids shown beside options. Include optionIndexes as backup. "
-                "IMPORTANT: optionIndexes are 1-based (first option is 1). "
-                "For single-choice/radio questions choose EXACTLY ONE answer. "
-                "For checkbox questions include all correct options.\n\n"
-                "Questions:\n"
-                + "\n".join(lines)
-            )
-
-            answer_json_text = ""
-            try:
-                completion = await quiz_reasoner_llm.ainvoke(
-                    [
-                        SystemMessage(content="Return strict JSON only. No markdown."),
-                        UserMessage(content=llm_prompt),
-                    ]
-                )
-                answer_json_text = str(completion.completion or "").strip()
-            except Exception:
                 try:
-                    completion = await quiz_reasoner_fallback_llm.ainvoke(
-                        [
-                            SystemMessage(content="Return strict JSON only. No markdown."),
-                            UserMessage(content=llm_prompt),
-                        ]
-                    )
-                    answer_json_text = str(completion.completion or "").strip()
-                except Exception as llm_err:
-                    print(f"[Quiz Handler] LLM answer selection failed: {llm_err}")
-                    return
+                    parsed = json.loads(text)
+                    return parsed if isinstance(parsed, dict) else None
+                except json.JSONDecodeError:
+                    pass
 
-            print(f"[Quiz Handler] LLM raw answer payload: {answer_json_text[:1000]}")
-
-            # Parse JSON robustly (supports accidental surrounding text/fences).
-            answer_payload = None
-            try:
-                answer_payload = json.loads(answer_json_text)
-            except json.JSONDecodeError:
-                match = re.search(r"\{[\s\S]*\}", answer_json_text)
+                # Try to salvage the largest JSON object in the response.
+                match = re.search(r"\{[\s\S]*\}", text)
                 if match:
+                    candidate = match.group(0)
                     try:
-                        answer_payload = json.loads(match.group(0))
+                        parsed = json.loads(candidate)
+                        return parsed if isinstance(parsed, dict) else None
                     except json.JSONDecodeError:
-                        answer_payload = None
+                        return None
+                return None
 
-            if not isinstance(answer_payload, dict) or not isinstance(answer_payload.get("answers"), list):
-                print("[Quiz Handler] Could not parse LLM answer JSON.")
+            async def request_answers_for_batch(batch_questions: list[dict], batch_label: str) -> dict | None:
+                lines = []
+                for q in batch_questions:
+                    lines.append(f"Q{q['questionNumber']}: {q['questionText']}")
+                    for idx, opt in enumerate(q.get("options", []), 1):
+                        lines.append(f"  {idx}. {opt.get('text', '')} [id={opt.get('inputId', '')}]")
+
+                llm_prompt = (
+                    "You are a CFP exam expert. Choose the best answer for each question. "
+                    "Return ONLY valid JSON with this schema: "
+                    "{\"answers\": [{\"questionNumber\": <int>, \"optionIndexes\": [<int>, ...], \"inputIds\": [<string>, ...]}]}. "
+                    "ALWAYS include inputIds using the exact ids shown beside options. Include optionIndexes as backup. "
+                    "IMPORTANT: optionIndexes are 1-based (first option is 1). "
+                    "For single-choice/radio questions choose EXACTLY ONE answer. "
+                    "For checkbox questions include all correct options.\n\n"
+                    "Questions:\n"
+                    + "\n".join(lines)
+                )
+
+                for attempt in range(1, 4):
+                    raw_text = ""
+                    try:
+                        completion = await quiz_reasoner_llm.ainvoke(
+                            [
+                                SystemMessage(content="Return strict JSON only. No markdown."),
+                                UserMessage(content=llm_prompt),
+                            ],
+                        )
+                        raw_text = str(completion.completion or "").strip()
+                    except Exception:
+                        try:
+                            completion = await quiz_reasoner_fallback_llm.ainvoke(
+                                [
+                                    SystemMessage(content="Return strict JSON only. No markdown."),
+                                    UserMessage(content=llm_prompt),
+                                ],
+                            )
+                            raw_text = str(completion.completion or "").strip()
+                        except Exception as llm_err:
+                            print(f"[Quiz Handler] {batch_label} LLM attempt {attempt} failed: {llm_err}")
+                            await asyncio.sleep(1.2)
+                            continue
+
+                    print(f"[Quiz Handler] {batch_label} raw answer payload: {raw_text[:800]}")
+                    parsed = parse_answer_payload(raw_text)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("answers"), list):
+                        return parsed
+
+                    print(f"[Quiz Handler] {batch_label} parse failed on attempt {attempt}; retrying...")
+                    await asyncio.sleep(0.8)
+
+                # If this batch fails repeatedly, split into smaller batches to avoid token/format issues.
+                if len(batch_questions) > 1:
+                    mid = len(batch_questions) // 2
+                    left = await request_answers_for_batch(batch_questions[:mid], f"{batch_label}.A")
+                    right = await request_answers_for_batch(batch_questions[mid:], f"{batch_label}.B")
+
+                    merged_answers: list[dict] = []
+                    if isinstance(left, dict) and isinstance(left.get("answers"), list):
+                        merged_answers.extend([a for a in left["answers"] if isinstance(a, dict)])
+                    if isinstance(right, dict) and isinstance(right.get("answers"), list):
+                        merged_answers.extend([a for a in right["answers"] if isinstance(a, dict)])
+
+                    if merged_answers:
+                        print(f"[Quiz Handler] {batch_label} recovered via sub-batching ({len(merged_answers)} answers).")
+                        return {"answers": merged_answers}
+
+                return None
+
+            # Large pages can exceed model output limits; answer in deterministic batches.
+            # User preference: answer one question at a time for reliability on long exams.
+            batch_size = 1
+            all_answers: list[dict] = []
+            failed_batches: list[str] = []
+            for start in range(0, len(questions), batch_size):
+                batch_questions = questions[start:start + batch_size]
+                batch_number = (start // batch_size) + 1
+                batch_label = f"Batch {batch_number}/{(len(questions) + batch_size - 1) // batch_size}"
+                payload = await request_answers_for_batch(batch_questions, batch_label)
+                if not payload:
+                    print(f"[Quiz Handler] {batch_label} could not produce valid JSON answers.")
+                    failed_batches.append(batch_label)
+                    continue
+                all_answers.extend([a for a in payload.get("answers", []) if isinstance(a, dict)])
+
+            if failed_batches:
+                print(f"[Quiz Handler] Skipping submit because some questions failed LLM answering: {', '.join(failed_batches[:20])}")
                 return
+
+            answer_payload = {"answers": all_answers}
 
             selected_input_ids: list[str] = []
             selected_human_lines: list[str] = []
