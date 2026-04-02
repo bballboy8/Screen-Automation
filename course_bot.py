@@ -3,7 +3,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from browser_use import Agent
 from browser_use.llm.messages import SystemMessage, UserMessage
@@ -31,6 +31,8 @@ class ProgressGuardState:
     last_quiz_signature: str = ""
     last_quiz_action_ts: float = 0.0
     last_forced_home_redirect_ts: float = 0.0
+    last_completion_redirect_ts: float = 0.0
+    quiz_attempts: dict = field(default_factory=dict)  # quiz_signature -> list[list[str]] of tried input_id sets
 
 
 async def main():
@@ -377,8 +379,14 @@ async def main():
             # Skip repeated re-answering if this exact quiz payload was just processed.
             quiz_signature = json.dumps(questions, sort_keys=True)
             now = time.time()
-            if guard.last_quiz_signature == quiz_signature and (now - guard.last_quiz_action_ts) < 12:
+            previous_attempts = guard.quiz_attempts.get(quiz_signature, [])
+            attempt_number = len(previous_attempts) + 1
+            # Use a shorter cooldown when retrying so we can try different answers sooner.
+            cooldown = 3.0 if previous_attempts else 12.0
+            if guard.last_quiz_signature == quiz_signature and (now - guard.last_quiz_action_ts) < cooldown:
                 return
+            if previous_attempts:
+                print(f"[Quiz Handler] Retrying quiz (attempt #{attempt_number}); {len(previous_attempts)} previous incorrect attempt(s) will be excluded from LLM choices.")
 
             def parse_answer_payload(raw_text: str) -> dict | None:
                 if not raw_text:
@@ -412,6 +420,29 @@ async def main():
                     for idx, opt in enumerate(q.get("options", []), 1):
                         lines.append(f"  {idx}. {opt.get('text', '')} [id={opt.get('inputId', '')}]")
 
+                # Build an id->readable-text map for options in this batch
+                id_to_label: dict[str, str] = {}
+                for q in batch_questions:
+                    for opt in q.get("options", []):
+                        iid = opt.get("inputId", "")
+                        if iid:
+                            id_to_label[iid] = f"Q{q['questionNumber']}: {opt.get('text', '')}"
+
+                # Build retry context from prior failed answer sets
+                retry_context = ""
+                if previous_attempts:
+                    retry_lines = []
+                    for attempt_idx, prev_ids in enumerate(previous_attempts[-5:], 1):
+                        relevant = [id_to_label[iid] for iid in prev_ids if iid in id_to_label]
+                        if relevant:
+                            retry_lines.append(f"  Attempt {attempt_idx}: {'; '.join(relevant)}")
+                    if retry_lines:
+                        retry_context = (
+                            "\n\nCRITICAL: The following previous answer attempt(s) were WRONG. "
+                            "Do NOT repeat these selections. Reason carefully and choose a DIFFERENT combination:\n"
+                            + "\n".join(retry_lines) + "\n\n"
+                        )
+
                 llm_prompt = (
                     "You are a CFP exam expert. Choose the best answer for each question. "
                     "Return ONLY valid JSON with this schema: "
@@ -420,7 +451,8 @@ async def main():
                     "IMPORTANT: optionIndexes are 1-based (first option is 1). "
                     "For single-choice/radio questions choose EXACTLY ONE answer. "
                     "For checkbox questions include all correct options.\n\n"
-                    "Questions:\n"
+                    + retry_context
+                    + "Questions:\n"
                     + "\n".join(lines)
                 )
 
@@ -655,6 +687,10 @@ async def main():
             )
 
             print(f"[Quiz Handler] Applied LLM-selected answers: {apply_result}; submit: {submit_result}")
+            # Record this attempt so future retries can avoid repeating the same answers.
+            if quiz_signature not in guard.quiz_attempts:
+                guard.quiz_attempts[quiz_signature] = []
+            guard.quiz_attempts[quiz_signature].append(list(selected_input_ids))
             guard.last_quiz_signature = quiz_signature
             guard.last_quiz_action_ts = time.time()
             await asyncio.sleep(2)
@@ -703,6 +739,16 @@ async def main():
                 const hasQuiz =
                     document.querySelector('fieldset[id^="ef-question-"], .que, form[id*="question"]') !== null;
 
+                const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const hasCourseCompletedText =
+                    bodyText.includes('course completed') ||
+                    bodyText.includes('congratulations') ||
+                    bodyText.includes('you have completed this course');
+
+                const hasCompletedOnlyButton = buttons.some(
+                    (b) => !b.disabled && (b.text === 'completed' || b.text === 'course completed')
+                );
+
                 const hasComplete = buttons.some(
                     (b) => !b.disabled && (b.text.includes('complete and continue') || b.text === 'next' || b.text.includes('continue'))
                 );
@@ -712,6 +758,8 @@ async def main():
                 return {
                     hasSkeleton,
                     hasQuiz,
+                    hasCourseCompletedText,
+                    hasCompletedOnlyButton,
                     hasComplete,
                     hasStartResume
                 };
@@ -749,6 +797,24 @@ async def main():
         # Only fire when NOT on the My Courses landing page.
         is_on_my_courses = "/start" in url or "/my-courses" in url or "/my_courses" in url
         now = time.time()
+
+        if (
+            not is_on_my_courses
+            and not snapshot.get("hasSkeleton")
+            and not snapshot.get("hasQuiz")
+            and (snapshot.get("hasCourseCompletedText") or snapshot.get("hasCompletedOnlyButton"))
+            and (now - guard.last_completion_redirect_ts) > 3.0
+        ):
+            print("Course completion page detected; returning to home page.")
+            await page.goto("https://learn.bostonifi.com/start")
+            guard.last_completion_redirect_ts = now
+            guard.last_url = "https://learn.bostonifi.com/start"
+            guard.same_url_steps = 0
+            guard.consecutive_skeleton_steps = 0
+            guard.forced_reload_count = 0
+            await asyncio.sleep(3)
+            return
+
         if (
             not is_on_my_courses
             and not snapshot.get("hasSkeleton")
